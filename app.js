@@ -422,27 +422,114 @@ function Coach(props) {
     }).catch(function(err){ setMsgs(function(m){ return [...m, {role:'assistant', text:'Network error: '+err.message}]; }); setLoading(false); });
   }
 
+  function extractFrames(file, callback) {
+    var NUM_FRAMES = 12;
+    var TRIM_PCT = 0.15; // skip first and last 15%
+    var JPEG_QUALITY = 0.55;
+    var MAX_DIM = 640; // cap frame dimensions to reduce token usage
+
+    var url = URL.createObjectURL(file);
+    var video = document.createElement('video');
+    video.preload = 'metadata';
+    video.muted = true;
+    video.playsInline = true;
+    video.src = url;
+    var frames = [];
+    var canvas = document.createElement('canvas');
+    var ctx = canvas.getContext('2d');
+
+    video.onloadedmetadata = function() {
+      var duration = video.duration;
+      var start = duration * TRIM_PCT;
+      var end = duration * (1 - TRIM_PCT);
+      var window = end - start;
+      var times = [];
+      for(var i=0; i<NUM_FRAMES; i++) {
+        times.push(start + (window / (NUM_FRAMES - 1)) * i);
+      }
+      var idx = 0;
+
+      function captureNext() {
+        if(idx >= times.length) {
+          URL.revokeObjectURL(url);
+          callback(frames);
+          return;
+        }
+        video.currentTime = times[idx];
+      }
+
+      video.onseeked = function() {
+        // Scale down if needed
+        var w = video.videoWidth, h = video.videoHeight;
+        if(w > MAX_DIM || h > MAX_DIM) {
+          var scale = MAX_DIM / Math.max(w, h);
+          w = Math.round(w * scale);
+          h = Math.round(h * scale);
+        }
+        canvas.width = w;
+        canvas.height = h;
+        ctx.drawImage(video, 0, 0, w, h);
+        frames.push(canvas.toDataURL('image/jpeg', JPEG_QUALITY).split(',')[1]);
+        idx++;
+        captureNext();
+      };
+
+      captureNext();
+    };
+
+    video.onerror = function() {
+      URL.revokeObjectURL(url);
+      callback([]);
+    };
+  }
+
   function analyzeFile(file) {
     setAnalyzing(true);
-    var reader=new FileReader();
-    reader.onload=function() {
-      var b64=reader.result.split(',')[1];
-      var isImage=file.type.startsWith('image/');
-      var content = isImage
-        ? [{type:'image', source:{type:'base64', media_type:file.type, data:b64}}, {type:'text', text:'Analyze this exercise form image. Identify: 1) Exercise performed, 2) Form strengths, 3) Form issues/compensation patterns, 4) Corrective cues, 5) Long-term coaching notes.'}]
-        : [{type:'text', text:'User uploaded video "'+file.name+'" for form analysis. Provide general form coaching cues for this exercise based on the filename, and ask them to describe what they noticed for more specific feedback.'}];
-      fetch(API_ENDPOINT, {
-        method:'POST', headers:{'Content-Type':'application/json'},
-        body:JSON.stringify({model:MODEL, max_tokens:1024, messages:[{role:'user', content:content}]})
-      }).then(function(res){ return res.json(); }).then(function(data) {
-        var text=(data.content&&data.content[0]&&data.content[0].text)||'Could not analyze.';
-        var analysis={date:new Date().toISOString(), filename:file.name, analysis:text};
-        saveFormAnalyses(function(prev){ return [...prev, analysis]; });
-        setMsgs(function(m){ return [...m, {role:'assistant', text:'Form analysis for "'+file.name+'":\n\n'+text}]; });
-        setAnalyzing(false);
-      }).catch(function(err){ setMsgs(function(m){ return [...m, {role:'assistant', text:'Analysis error: '+err.message}]; }); setAnalyzing(false); });
-    };
-    reader.readAsDataURL(file);
+    var isImage = file.type.startsWith('image/');
+
+    if(isImage) {
+      var reader = new FileReader();
+      reader.onload = function() {
+        var b64 = reader.result.split(',')[1];
+        var content = [
+          {type:'image', source:{type:'base64', media_type:file.type, data:b64}},
+          {type:'text', text:'Analyze this exercise form image. Identify: 1) Exercise performed, 2) Form strengths, 3) Form issues or compensation patterns, 4) Specific corrective cues, 5) Long-term coaching notes.'}
+        ];
+        sendFormAnalysis(file.name, content);
+      };
+      reader.readAsDataURL(file);
+    } else {
+              extractFrames(file, function(frames) {
+        if(frames.length === 0) {
+          setMsgs(function(m){ return [...m, {role:'assistant', text:'Could not extract frames from this video. Try uploading a screenshot or photo instead.'}]; });
+          setAnalyzing(false);
+          return;
+        }
+        var content = [];
+        frames.forEach(function(b64, i) {
+          content.push({type:'image', source:{type:'base64', media_type:'image/jpeg', data:b64}});
+          content.push({type:'text', text:'Frame '+(i+1)+' of '+frames.length});
+        });
+        content.push({type:'text', text:'These are '+frames.length+' frames extracted from the working portion of an exercise form video ("'+file.name+'"), trimmed to skip setup and breakdown footage. Frames are evenly spaced through the middle 70% of the video. Analyze the movement across all frames. Identify: 1) Exercise being performed, 2) Form strengths, 3) Form issues or compensation patterns visible across the frames, 4) Specific corrective cues with timestamps/positions where possible, 5) Long-term coaching notes for programming.'});
+        sendFormAnalysis(file.name, content);
+      });
+    }
+  }
+
+  function sendFormAnalysis(filename, content) {
+    fetch(API_ENDPOINT, {
+      method:'POST', headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({model:MODEL, max_tokens:1024, messages:[{role:'user', content:content}]})
+    }).then(function(res){ return res.json(); }).then(function(data) {
+      var text = (data.content&&data.content[0]&&data.content[0].text)||'Could not analyze.';
+      var analysis = {date:new Date().toISOString(), filename:filename, analysis:text};
+      saveFormAnalyses(function(prev){ return [...prev, analysis]; });
+      setMsgs(function(m){ return [...m, {role:'assistant', text:'Form analysis for "'+filename+'":\n\n'+text}]; });
+      setAnalyzing(false);
+    }).catch(function(err) {
+      setMsgs(function(m){ return [...m, {role:'assistant', text:'Analysis error: '+err.message}]; });
+      setAnalyzing(false);
+    });
   }
 
   return e(Fragment, null,
